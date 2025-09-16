@@ -1,0 +1,1662 @@
+---
+title: "Political_Causal_Language"
+author: "Calvin Isch"
+date: "2025-09-11"
+output: html_document
+---
+
+Ensure package versions match for reproducibility
+```{r, eval=FALSE}
+#renv::init()
+#renv::snapshot(prompt = FALSE)
+
+if (!requireNamespace("renv", quietly = TRUE)) install.packages("renv"); 
+renv::restore(prompt = FALSE)
+```
+
+Load the data and necessary packages
+```{r}
+library(lme4); library(lmerTest); library(ggplot2); library(dplyr); library(tidyr); library(cowplot); library(broom); library(broom.mixed); library(patchwork); library(grid);library(scales); library(lattice); library(DHARMa)
+library(irr); library(modelsummary); library(influence.ME); library(coin)
+library(sandwich);library(lmtest);library(gt); library(emmeans); library(forcats)
+
+df <- read.csv('political_ratings.csv')
+
+df = df %>% filter(Rating != "") # Remove rows with empty Rating values
+# Only removes 25 entries
+25 / nrow(df)
+
+# Turn off science notation
+options(scipen = 999)
+```
+
+# Results section
+
+Descriptives
+```{r}
+# Counts and proportions that are apolitical vs political
+table(df$Rating)
+prop.table(table(df$Rating))
+
+# Counts and proportions of slant
+table(df$Slant)
+prop.table(table(df$Slant))
+
+# Because so few strong left/right slant combine them to adjacent categories
+df$Slant_All <- df$Slant
+df <- df %>% 
+  mutate(Slant = case_when(
+    Slant == 1 ~ 2,
+    Slant == 7 ~ 6,
+    TRUE ~ Slant
+  ))
+
+# Proportion of slanted in each category
+prop.table(df %>% filter(Rating == "P", Slant != 4) %>% select(Slant) %>% table())
+
+# Proportion of slanted left, then right.
+0.629 + 0.299
+0.062 + 0.009
+
+# Ratio
+(df %>% filter(Slant %in% c(1, 2, 3)) %>% nrow()) / (df %>% filter(Slant %in% c(5, 6, 7)) %>% nrow())
+
+# Recode Decade to account for those with fewer than 10 observations
+df <- df %>%
+  mutate(Decade = as.character(Decade)) %>%
+  mutate(Decade = case_when(
+    Decade %in% c("1900", "1910", "1920", "1930", "1940", "2030") ~ "Other",
+    TRUE ~ Decade
+  ))
+table(df$Decade)
+
+# Show proportion political by decade
+df %>% group_by(Decade) %>%
+  summarize(
+    n_total = n(),
+    n_P = sum(Rating == "P", na.rm = TRUE),
+    prop_P = n_P / n_total
+  )
+
+# Proportion of political that is slanted by decade
+df %>% filter(Rating=="P") %>% group_by(Decade) %>%
+  summarize(
+    n_total = n(),
+    n_S = sum(Slant %in% c(1,2,3,5,6,7), na.rm = TRUE),
+    prop_S = n_S / n_total
+  )
+
+# Proportion balanced or apolitical overall:
+((df %>% filter(Rating == "A") %>% nrow()) + (df %>% filter(Slant == "4") %>% nrow())) / nrow(df)
+
+```
+
+Primary Model: (Model F) See other models in SI
+```{r}
+df_pol <- df %>%
+  mutate(
+    Slant_Cat = case_when(
+      Rating == "A" ~ "Apolitical",
+      Slant == 1 ~ "Strong left",
+      Slant == 2 ~ "Left",
+      Slant == 3 ~ "Slight left",
+      Slant == 4 ~ "Balanced",
+      Slant == 5 ~ "Slight right",
+      Slant == 6 ~ "Right",
+      Slant == 7 ~ "Strong right",
+      TRUE ~ as.character(Slant)  # fall-back for any unhandled values
+    ))
+
+
+model_f <- glmer(
+  Causal ~ Slant_Cat + (1 | Discipline) + (1 | Decade),
+  data = df_pol,
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+summary(model_f)
+
+s      <- summary(model_f)          
+coefs  <- s$coefficients                     
+ps <- coefs[, "Pr(>|z|)"] 
+p.adjust(ps[2:6], method = "holm")
+
+coefs <- summary(model_f)$coefficients
+ci <- confint(model_f, method = "Wald")  # or method = "profile"
+odds_ratios <- exp(cbind(coef = fixef(model_f), ci[rownames(ci) %in% names(fixef(model_f)), ]))
+
+round(odds_ratios, 3)
+```
+
+Model Comparison of slanted to balanced (OR in abstract)
+```{r}
+df_pol <- df_pol %>%
+  mutate(Slant_binary = if_else(Slant_All == 4, "Balanced", "Slanted"))
+  
+
+model_b <- glmer(
+  Causal ~ Slant_binary + (1 | Discipline) + (1 | Decade),
+  data = df_pol %>% filter(Rating == "P"),
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+summary(model_b)
+
+coefs <- summary(model_b)$coefficients
+ci <- confint(model_b, method = "Wald")  # or method = "profile"
+odds_ratios <- exp(cbind(coef = fixef(model_b), ci[rownames(ci) %in% names(fixef(model_b)), ]))
+
+round(odds_ratios, 3)
+```
+
+# Plots
+Descriptive plot showing political rating and slant over time (2x2)
+```{r}
+# Make a descriptive 2x2 grid of plots
+
+############# TOP LEFT ########
+rating_counts <- df %>%
+  count(Rating) %>%
+  mutate(Rating = factor(Rating, levels = c("A", "P"))) %>%
+  complete(Rating, fill = list(n = 0))
+
+top_left <- ggplot(rating_counts, aes(Rating, n, fill = Rating)) +
+  geom_col() +
+  scale_fill_manual(values = c("A" = "#8c8c8c", "P" = "purple")) +
+  geom_col(
+    data   = filter(rating_counts, Rating == "P"),
+    aes(Rating, n),
+    fill   = NA,
+    colour = "black",
+    size   = 1.5
+  ) +
+  scale_x_discrete(labels = c("A" = "Apolitical", "P" = "Political")) +
+  labs(title = "(A-)political Ratings", y = "Count", x = NULL) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+
+
+######## TOP RIGHT ########
+decade_rate_PA <- df %>%
+  filter(Decade != "Other") %>%
+  group_by(Decade) %>%
+  summarize(
+    n_total = n(),
+    n_P = sum(Rating == "P", na.rm = TRUE),
+    n_A = sum(Rating == "A", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(c(n_P, n_A), names_to = "Rating", values_to = "n_yes") %>%
+  mutate(
+    Rating = ifelse(Rating == "n_P", "Political", "Apolitical"),
+    prop   = n_yes / n_total,
+    se     = sqrt(prop * (1 - prop) / n_total),
+    se_lo  = pmax(0, prop - se),
+    se_hi  = pmin(1, prop + se)
+  )
+
+# Put Political on the bottom, Apolitical on top
+decade_rate_PA$Rating <- factor(decade_rate_PA$Rating, levels = c("Apolitical", "Political"))
+
+# Boundary where the stacks meet = height of Political segment
+boundary_ci <- decade_rate_PA %>%
+  filter(Rating == "Political") %>%
+  transmute(
+    Decade  = as.factor(Decade),
+    meet    = prop,      # boundary height
+    meet_lo = se_lo,     # ±1 SE around Political share
+    meet_hi = se_hi
+  )
+
+top_right <- ggplot(decade_rate_PA,
+                    aes(x = as.factor(Decade), y = prop, fill = Rating)) +
+  geom_col(width = 0.8) +
+  # SE interval at the meeting point with whiskers
+  geom_errorbar(
+    data = boundary_ci,
+    aes(x = Decade, ymin = meet_lo, ymax = meet_hi),
+    inherit.aes = FALSE,
+    width = 0.25,        # whisker cap width
+    linewidth = 0.5
+  ) +
+  # (optional) center tick at the boundary
+  geom_point(
+    data = boundary_ci,
+    aes(x = Decade, y = meet),
+    inherit.aes = FALSE,
+    shape = '.', size = 4
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, 1),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_manual(values = c("Apolitical" = "#8c8c8c", "Political" = "purple")) +
+  labs(
+    x = "Decade",
+    y = "Share of articles (±1 SE at boundary)",
+    fill = "Rating",
+    title = "Share of (A-)political Articles by Decade"
+  ) +
+  theme_bw()
+
+######### Bottom left ##########
+slant_cols  <- c(
+  "Strong left"    = "#2166ac",
+  "Left"        = "#4393c3",
+  "Slight left" = "#92c5de",
+  "Balanced"    = "gray70",
+  "Slight right"= "#f4a582",
+  "Right"       = "#d6604d",
+  "Strong right"   = "#b2182b"
+)
+
+slant_counts <- df %>%
+  filter(Rating == "P") %>%
+  count(Slant) %>%
+  complete(Slant = 1:7, fill = list(n = 0)) %>%
+  arrange(Slant) %>%
+  mutate(
+    Slant = factor(
+      Slant,
+      levels = 1:7,
+      labels = c(
+        "Strong left", "Left", "Slight left",
+        "Balanced","Slight right", "Right", "Strong right"
+      )
+    )
+  ) %>% drop_na()
+
+bottom_left <- ggplot(slant_counts, aes(x = 1, y = n, fill = Slant)) +
+  geom_col(position = position_stack(reverse = TRUE)) +
+  scale_fill_manual(values = slant_cols) +
+  coord_flip() +
+  labs(
+    title = "Slant of Political Articles",
+    y     = "Count",
+    x     = ""
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.y   = element_blank(),
+    axis.ticks.y  = element_blank()
+  ) +
+  theme(legend.position = "none")
+
+
+####### Bottom right ########
+slant_levels <- c("Strong left","Left","Slight left","Balanced",
+                  "Slight right","Right","Strong right")
+
+decade_slant_grouped <- df %>%
+  filter(Rating == "P", Decade != "Other") %>%
+  mutate(
+    SlantLabel = case_when(
+      Slant == 1 ~ "Strong left",
+      Slant == 2 ~ "Left",
+      Slant == 3 ~ "Slight left",
+      Slant == 4 ~ "Balanced",
+      Slant == 5 ~ "Slight right",
+      Slant == 6 ~ "Right",
+      Slant == 7 ~ "Strong right",
+      TRUE ~ NA_character_
+    ),
+    SideGroup = case_when(
+      Slant %in% 1:3 ~ "Left-leaning",
+      Slant == 4    ~ "Balanced",
+      Slant %in% 5:7 ~ "Right-leaning",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(SlantLabel), !is.na(SideGroup)) %>%
+  count(Decade, SideGroup, SlantLabel, name = "n") %>%
+  group_by(Decade) %>%
+  mutate(Proportion = n / sum(n)) %>%   # denom = all Politivsl in that decade
+  ungroup() %>%
+  mutate(
+    DecadeF    = factor(Decade),
+    SlantLabel = factor(SlantLabel, levels = slant_levels),
+    SideGroup  = factor(SideGroup,  levels = c("Left-leaning","Balanced","Right-leaning"))
+  )
+
+# x-offset trick to force stacks within each dodged group
+offset_map <- c("Left-leaning" = -0.28, "Balanced" = 0, "Right-leaning" = 0.28)
+dec_levels <- levels(decade_slant_grouped$DecadeF)
+
+plot_data <- decade_slant_grouped %>%
+  mutate(
+    x0   = as.numeric(DecadeF),
+    xpos = x0 + unname(offset_map[as.character(SideGroup)])
+  )
+
+# --- SEs for each dodged stack (aggregate per SideGroup within decade) ---
+stack_summary <- decade_slant_grouped %>%
+  group_by(Decade) %>%
+  mutate(n_total_decade = sum(n)) %>%
+  group_by(Decade, SideGroup, n_total_decade) %>%
+  summarise(n_group = sum(n), .groups = "drop") %>%
+  mutate(
+    Prop = n_group / n_total_decade,
+    se   = sqrt(Prop * (1 - Prop) / n_total_decade),
+    DecadeF = factor(Decade),
+    xpos    = as.numeric(DecadeF) + unname(offset_map[as.character(SideGroup)]),
+    p_lo    = pmax(0, Prop - se),
+    p_hi    = pmin(1, Prop + se)
+  )
+
+bottom_right <- ggplot(plot_data, aes(x = xpos, y = Proportion, fill = SlantLabel)) +
+  geom_col(width = 0.25) +  # stacks within each offset (Left/Bal/Right)
+  geom_errorbar(
+    data = stack_summary,
+    aes(x = xpos, ymin = p_lo, ymax = p_hi),
+    inherit.aes = FALSE, width = 0.15, linewidth = 0.5, color = "black"
+  ) +
+  scale_x_continuous(breaks = seq_along(dec_levels), labels = dec_levels) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  scale_fill_manual(values = slant_cols, breaks = slant_levels) +
+  labs(
+    x = "Decade",
+    y = "Proportion (SEs)",
+    fill = "Slant",
+    title = "Slant of Political Articles by Decade"
+  ) +
+  theme_bw() +
+  theme(legend.position = "right")
+
+top_row <- plot_grid(top_left,  top_right,  ncol = 2, rel_widths = c(1, 2.5), labels = c('A', 'B'))
+bot_row <- plot_grid(bottom_left, bottom_right, ncol = 2, rel_widths = c(1, 2.5), labels = c('C', 'D'))
+
+# Add a thick black border around the entire bottom row
+bot_row_bordered <- ggdraw(bot_row) +
+  theme(
+    plot.background = element_rect(colour = "black", fill = NA, linewidth = 3),
+    plot.margin = margin(3, 3, 3, 3)  # optional padding inside the border
+  )
+
+# Final figure: top row normal, bottom row with border
+final <- plot_grid(top_row, bot_row_bordered, ncol = 1, rel_heights = c(1, 1))
+
+ggdraw(final) +
+  draw_grob(segmentsGrob(
+    x0 = 0.265, y0 = 0.562, x1 = 0.335, y1 = 0.497,
+    gp    = gpar(col = "black", lwd = 2.5),
+    arrow = arrow(length = unit(0, "cm"))
+  ))
+ggsave('figures/descriptives_2x2.png', height=6, width=9)
+
+```
+
+Categorical Slant Odds ratios (i.e., main model estimates)
+```{r}
+
+# 1. Extract coefficients and confidence intervals from the model
+model_summary <- tidy(model_f, conf.int = TRUE, exponentiate = TRUE) 
+
+# 2. Filter for Slant-related terms and clean labels
+slant_or <- model_summary %>%
+  filter(grepl("Slant", term)) %>%
+  select(term, estimate, conf.low, conf.high) %>%
+  rename(
+    OR = estimate,
+    CI_lower = conf.low,
+    CI_upper = conf.high
+  ) %>%
+  mutate(
+    err_lower = OR - CI_lower,
+    err_upper = CI_upper - OR
+  )
+
+slant_or <- slant_or %>%
+  mutate(
+    Slant = gsub("Slant_Cat", "", term),
+    Slant = factor(Slant, levels = c("Strong left","Left","Slight left","Balanced", "Slight right","Right","Strong right"))  # preserve order
+  )
+
+# 3. Plot
+ggplot(slant_or, aes(x = Slant, y = OR, fill=Slant)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray") +
+  labs(
+    title = 'Odds of Causal Overstatment Relative to "Apolitical"',
+    y = "Odds Ratio with 95% CIs",
+    x = "") +
+  scale_fill_manual(values = slant_cols) +
+  theme_bw() +
+  coord_cartesian(ylim = c(0, 2))
+
+ggsave('figures/slant_odds_ratios.png', height=3.5, width=6)
+```
+
+
+# Validation (Methods)
+
+Political relevance and slant validation
+```{r}
+df_pv <- read.csv("Political_Validation.csv", fileEncoding = "UTF-8")
+
+cat("N unique scholars:", length(unique(df_pv$Nominator_ID)), "\n")
+
+# Groupby scholar and get mean, median, and range of their number of nominations
+df_pv %>% group_by(Nominator_ID) %>%
+  summarize(
+    n = n()
+  ) %>%
+  summarize(
+    mean = mean(n),
+    median = median(n),
+    min = min(n),
+    max = max(n)
+  ) %>%
+  print()
+
+
+print(sort(table(df_pv$Human.Rating), decreasing = TRUE))
+
+recode_map <- c(
+  "Apolitical"   = "Apolitical",
+  "Balanced"     = "4",
+  "Strong left"  = "1",
+  "Left"         = "2",
+  "Slightly left"= "3",
+  "Slightly right"="5",
+  "Right"        = "6",
+  "Strong right" = "7"
+)
+
+df_pv$Human.Rating <- dplyr::recode(df_pv$Human.Rating, !!!recode_map)
+
+print(paste("Number reviewed by panel:", nrow(df_pv %>%filter(Panel_Reviewed == 1))))
+
+ct <- table(df_pv$Human.Rating, df_pv$Final.Rating, useNA = "ifany")
+ct_m <- addmargins(ct)
+rownames(ct_m)[nrow(ct_m)] <- "Total"
+colnames(ct_m)[ncol(ct_m)] <- "Total"
+cat("\nCrosstab: Human Rating vs Final Rating (with totals)\n")
+print(ct_m)
+
+print(paste("Number requiring updates:", nrow(df_pv %>% filter(Human.Rating != Final.Rating))))
+print(paste("N Training/Testing:", nrow(df_pv %>% filter(Training == 1)), nrow(df_pv %>% filter(Training == 0))))
+
+
+compute_metrics <- function(y_true, y_pred) {
+  # Restrict to valid binary labels {0,1}
+  ok <- (y_true %in% c(0, 1)) & (y_pred %in% c(0, 1))
+  y_true <- y_true[ok]
+  y_pred <- y_pred[ok]
+
+  TP <- sum(y_true == 1 & y_pred == 1)
+  FP <- sum(y_true == 0 & y_pred == 1)
+  FN <- sum(y_true == 1 & y_pred == 0)
+  TN <- sum(y_true == 0 & y_pred == 0)
+  N  <- TP + FP + FN + TN
+
+  precision <- if ((TP + FP) > 0) TP / (TP + FP) else 0
+  recall    <- if ((TP + FN) > 0) TP / (TP + FN) else 0
+  f1        <- if ((precision + recall) > 0) 2 * precision * recall / (precision + recall) else 0
+  accuracy  <- if (N > 0) (TP + TN) / N else NA_real_
+
+  list(Precision = precision, Recall = recall, F1 = f1, Accuracy = accuracy)
+}
+
+
+# ---------- TRAIN split ----------
+df_train <- df_pv %>% filter(Training == 1)
+
+df_train$GPT_Binary <- ifelse(df_train$Rating %in% "Political", 1,
+                         ifelse(df_train$Rating %in% "Apolitical", 0, -1))
+df_train$Human_Binary <- ifelse(df_train$Final.Rating %in% as.character(1:7), 1,
+                           ifelse(df_train$Final.Rating %in% "Apolitical", 0, -1))
+
+cat("\nTRAIN: Crosstab Rating vs Human_Binary (with totals)\n")
+ct_train <- table(df_train$Rating, df_train$Human_Binary, useNA = "ifany")
+ct_train_m <- addmargins(ct_train)
+rownames(ct_train_m)[nrow(ct_train_m)] <- "Total"
+colnames(ct_train_m)[ncol(ct_train_m)] <- "Total"
+print(ct_train_m)
+
+m <- compute_metrics(df_train$Human_Binary, df_train$GPT_Binary)
+cat(sprintf("TRAIN (Political=1): Precision: %.2f, Recall: %.2f, F1 Score: %.2f, Accuracy: %.2f\n",
+            m$Precision, m$Recall, m$F1, m$Accuracy))
+
+# ---------- EVAL split ----------
+df_eval <- df_pv %>% filter(Training == 0)
+
+df_eval$GPT_Binary <- ifelse(df_eval$Rating %in% "Political", 1,
+                        ifelse(df_eval$Rating %in% "Apolitical", 0, -1))
+df_eval$Human_Binary <- ifelse(df_eval$Final.Rating %in% as.character(1:7), 1,
+                          ifelse(df_eval$Final.Rating %in% "Apolitical", 0, -1))
+
+cat("\nEVAL: Crosstab Rating vs Human_Binary (with totals)\n")
+ct_eval <- table(df_eval$Rating, df_eval$Human_Binary, useNA = "ifany")
+ct_eval_m <- addmargins(ct_eval)
+rownames(ct_eval_m)[nrow(ct_eval_m)] <- "Total"
+colnames(ct_eval_m)[ncol(ct_eval_m)] <- "Total"
+print(ct_eval_m)
+
+m <- compute_metrics(df_eval$Human_Binary, df_eval$GPT_Binary)
+cat(sprintf("EVAL (Political=1): Precision: %.2f, Recall: %.2f, F1 Score: %.2f, Accuracy: %.2f\n",
+            m$Precision, m$Recall, m$F1, m$Accuracy))
+
+# ---------- Slant agreement (TRAIN) ----------
+df_slant <- df_train %>% filter(Rating == "Political") %>% mutate(
+  Slant = ifelse(Slant == "Apolitical", "4", Slant),
+  Final.Rating = ifelse(Final.Rating == "Apolitical", "4", Final.Rating)
+)
+
+df_slant$Rating <- as.integer(df_slant$Slant)
+df_slant$Final.Rating <- as.integer(df_slant$Final.Rating)
+
+cat("\nTRAIN Slant Agreement\n")
+cat("N", nrow(df_slant), "\n")
+
+# Quadratic-weighted Cohen's kappa
+k_train <- irr::kappa2(data.frame(df_slant$Final.Rating, df_slant$Rating), weight = "squared")
+cat(sprintf("Kappa: %.4f\n", k_train$value))
+
+# Spearman correlation
+s_train <- suppressWarnings(cor.test(df_slant$Final.Rating, df_slant$Rating, method = "spearman", exact = FALSE))
+cat(sprintf("Spearman: rho=%.4f, p=%.3g\n", unname(s_train$estimate), s_train$p.value))
+
+# ---------- Slant agreement (EVAL) ----------
+df_slant <- df_eval %>% filter(Rating == "Political") %>% mutate(
+  Slant = ifelse(Slant == "Apolitical", "4", Slant),
+  Final.Rating = ifelse(Final.Rating == "Apolitical", "4", Final.Rating)
+)
+
+df_slant$Rating <- as.integer(df_slant$Slant)
+df_slant$Final.Rating <- as.integer(df_slant$Final.Rating)
+
+cat("\nEVAL Slant Agreement\n")
+cat("N", nrow(df_slant), "\n")
+
+k_eval <- irr::kappa2(data.frame(df_slant$Final.Rating, df_slant$Rating), weight = "squared")
+cat(sprintf("Kappa: %.4f\n", k_eval$value))
+
+s_eval <- suppressWarnings(cor.test(df_slant$Final.Rating, df_slant$Rating, method = "spearman", exact = FALSE))
+cat(sprintf("Spearman: rho=%.4f, p=%.3g\n", unname(s_eval$estimate), s_eval$p.value))
+```
+
+Cross Sectional Validation
+```{r}
+df_csv <- read.csv('Cross-Sectional-Validation.csv')
+
+coders <- as.data.frame(df_csv[, c("Coder_1","Coder_2","Coder_3")], stringsAsFactors = FALSE)
+mat <- t(as.matrix(coders)) 
+irr::kripp.alpha(mat, method = "interval")
+
+m <- compute_metrics(df_csv$Consensus.Binary, df_csv$GPT.Binary)
+cat(sprintf("TRAIN (Political=1): Precision: %.2f, Recall: %.2f, F1 Score: %.2f, Accuracy: %.2f\n",
+            m$Precision, m$Recall, m$F1, m$Accuracy))
+
+```
+
+Causal Validation
+```{r}
+df_cv <- read.csv('Causal-Validation.csv')
+
+coders <- as.data.frame(df_cv[, c("Coder_1_binary","Coder_2_binary","Coder_3_binary")], stringsAsFactors = FALSE)
+mat <- t(as.matrix(coders)) 
+irr::kripp.alpha(mat, method = "interval")
+
+m <- compute_metrics(df_cv$Final_binary, df_cv$GPT_binary)
+cat(sprintf("TRAIN (Political=1): Precision: %.2f, Recall: %.2f, F1 Score: %.2f, Accuracy: %.2f\n",
+            m$Precision, m$Recall, m$F1, m$Accuracy))
+
+# Overall causal percentage
+prop.table(table(df$Causal))
+```
+
+For the methodology (Cross sectional) and causal validations, see the following OSF
+page for more details: https://osf.io/zpua6/?view_only=e290bc25f1634205b3c9c809fbd4faeb
+
+
+# Supplemental Materials
+
+Drawing Stratified Random Sample for validation of political slant in cross-sectional articles
+```{r, eval=FALSE}
+# Set seed
+set.seed(42)
+
+# Fill NA with "Apolitical"
+df <- df %>%
+  mutate(Slant = ifelse(is.na(Slant), 7, Slant))  # Treat NA as Apolitical (7)
+
+table(df$Slant)
+
+# Stratified random sample of 40 per category, stratified by Slant (2-6 + Apolitcal)
+df_sample <- df %>%
+  group_by(Slant) %>%
+  slice_sample(n = 20, replace = FALSE) %>%
+  ungroup()
+
+# Shuffle and save
+df_shuffle <- df_sample[sample(nrow(df_sample)),]
+
+# Get citation information for easy lookup
+df_cites <- read.csv("citation.csv")
+df_cites$ID <- df_cites$GOID
+df_cites <- df_cites %>% select(ID, Title, Date, Authors, Publication.Title)
+
+
+# Merge
+df_shuffle <- df_shuffle %>%
+  left_join(df_cites, by = "ID") %>%
+  select(ID, Title, Date, Authors, Publication.Title)
+
+write.csv(df_shuffle, 'political_ratings_validation_sample.csv', row.names = FALSE)
+
+# Note: The english version of these articles were not available and were swapped with another randomly selected
+# one from their respective slant category:
+# 217681138 -> 3108614919
+# 2876747201 -> 3143002223
+# 2061968330 -> 1443709517
+# 205231828 -> 1022612391
+# 1928185386 -> 1686086000
+```
+
+Checking that sample against manual ratings
+```{r}
+df_man_check <- read.csv("Political_Validation_Cross-Sect.csv")
+
+# Fix bad rating
+df_man_check <- df_man_check %>% mutate(
+  Manual.Rating = recode(Manual.Rating, "Slight Right" = "Slight right"),
+  
+) %>% drop_na()
+
+# Make a binary version and also
+df_man_check <- df_man_check %>%
+  mutate(
+    Political_Content = ifelse(Manual.Rating == "Apolitical", 0, 1),
+    Manual.Rating = factor(Manual.Rating, levels = c("Left", "Slight left", "Balanced", "Slight right", "Right"))
+  )
+
+# Merge with df
+df_man_check <- df_man_check %>%
+  left_join(df %>% select(ID, Rating, Slant), by = "ID")  %>%
+  mutate(Rating = ifelse(Rating == "A", 0, 1))
+
+# Make 2x2 for Political Content vs Rating and calculate Accuracy, Precision, Recall, and F1
+tab_polcontent <- table(df_man_check$Political_Content, df_man_check$Rating)
+tab_polcontent
+
+# Accuracy, Precision, Recall, and F1 with human as base.
+accuracy <- sum(diag(tab_polcontent)) / sum(tab_polcontent)
+Precision <- tab_polcontent[2, 2] / sum(tab_polcontent[, 2])  
+Recall <- tab_polcontent[2, 2] / sum(tab_polcontent[2, ])
+F1 <- 2 * (Precision * Recall) / (Precision + Recall)
+# Calculate a p-value using a chi-squared test
+chisq.test(tab_polcontent)
+
+# Now limit to political articles by GPT and compare slant with kendal tau
+df_man_check <- df_man_check %>% filter(Rating == "1")
+tab_slant <- table(df_man_check$Slant, df_man_check$Manual.Rating)
+cor.test(df_man_check$Slant, as.numeric(df_man_check$Manual.Rating), method = "kendall")
+cor.test(df_man_check$Slant, as.numeric(df_man_check$Manual.Rating), method = "spearman")
+
+# Cohen's Kappa
+df_man_check$Human <- as.numeric(df_man_check$Manual.Rating)
+df_man_check$Human[is.na(df_man_check$Human)] <- 4
+kappa2(df_man_check[, c("Slant", "Human")] %>% drop_na(), "squared")
+
+```
+
+# Modeling
+Model A
+```{r}
+df <- read.csv('political_ratings.csv')
+
+df = df %>% 
+  filter(Rating != "") %>% 
+  mutate(Slant_All = Slant,
+    Slant = case_when(
+      Slant == 1 ~ 2,
+      Slant == 7 ~ 6,
+      TRUE ~ Slant),
+    Decade = as.character(Decade)) %>%
+  mutate(Decade = case_when(
+    Decade %in% c("1900", "1910", "1920", "1930", "1940", "2030") ~ "Other",
+    TRUE ~ Decade
+  ))
+
+df_pol <- df %>% 
+  mutate(Rating = recode(Rating, "A" = "Apolitical", "P" = "Political"),
+         Rating = factor(Rating, levels = c("Apolitical", "Political")))
+model_a <- glmer(
+  Causal ~ Rating + (1 | Discipline) + (1 | Decade),
+  data = df_pol,
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+summary(model_a)
+```
+
+Model B and C
+```{r}
+df_pol <- df_pol %>%
+  mutate(Slant_binary = if_else(Slant == 4, "Balanced", "Slanted"),
+         Slant_abs = abs(Slant - 4))
+  
+
+model_b <- glmer(
+  Causal ~ Slant_binary + (1 | Discipline) + (1 | Decade),
+  data = df_pol %>% filter(Rating == "Political"),
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+summary(model_b)
+
+model_c <- glmer(
+  Causal ~ Slant_abs + (1 | Discipline) + (1 | Decade),
+  data = df_pol %>% filter(Rating == "Political"),
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+summary(model_c)
+
+df_pol <- df_pol %>%
+  mutate(Slant_Abs7 = abs(Slant - 4))
+
+model_c_7 <- glmer(
+  Causal ~ Slant_Abs7 + (1 | Discipline) + (1 | Decade),
+  data = df_pol %>% filter(Rating == "Political"),
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+summary(model_c_7)
+
+```
+
+Models D & E
+```{r}
+df_pol <- df_pol %>% 
+  mutate(Left_Leaning = if_else(Slant < 4, "Left", "All_Other"),
+         Left_Leaning = factor(Left_Leaning, levels = c("All_Other", "Left")))
+
+model_d <- glmer(
+  Causal ~ Slant_binary + Left_Leaning + (1 | Discipline) + (1 | Decade),
+  data = df_pol %>% filter(Rating == "Political"),
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+summary(model_d)
+
+
+model_e <- glmer(
+  Causal ~ Slant_abs * Left_Leaning + (1 | Discipline) + (1 | Decade),
+  data = df_pol %>% filter(Rating == "Political"),
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+summary(model_e)
+
+model_e_7 <- glmer(
+  Causal ~ Slant_Abs7 * Left_Leaning + (1 | Discipline) + (1 | Decade),
+  data = df_pol %>% filter(Rating == "Political"),
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+summary(model_e_7)
+  
+
+```
+
+Model F
+```{r}
+df_pol <- df %>%
+  mutate(
+    Slant_Cat = case_when(
+      Rating == "A" ~ "Apolitical",
+      Slant == 1 ~ "Strong left",
+      Slant == 2 ~ "Left",
+      Slant == 3 ~ "Slight left",
+      Slant == 4 ~ "Balanced",
+      Slant == 5 ~ "Slight right",
+      Slant == 6 ~ "Right",
+      Slant == 7 ~ "Strong right",
+      TRUE ~ as.character(Slant)  # fall-back for any unhandled values
+    ))
+
+
+model_f <- glmer(
+  Causal ~ Slant_Cat + (1 | Discipline) + (1 | Decade),
+  data = df_pol,
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+summary(model_f)
+
+s      <- summary(model_f)          
+coefs  <- s$coefficients                     
+ps <- coefs[, "Pr(>|z|)"] 
+p.adjust(ps[2:6], method = "holm")
+
+coefs <- summary(model_f)$coefficients
+ci <- confint(model_f, method = "Wald")  # or method = "profile"
+odds_ratios <- exp(cbind(coef = fixef(model_f), ci[rownames(ci) %in% names(fixef(model_f)), ]))
+
+round(odds_ratios, 3)
+
+```
+
+All models in nice table
+```{r}
+modelsummary(
+  list(
+    "Apolitical vs Political" = model_a,
+    "Slanted vs Balanced" = model_b,
+    "Slant Abs Distance" = model_c,
+    "Slanted x Left Lean" = model_d,
+    "Slant Abs x Left Lean" = model_e,
+    "Non-linear Slant" = model_f
+  ),
+  stars = TRUE,
+  estimate = "{estimate} ({std.error})",
+  statistic = NULL,
+  confint = FALSE,
+  gof_omit = "IC|Log|Adj",  # omit less-relevant goodness-of-fit stats
+  title = "Comparison of Logistic Models Predicting Causal Language"
+)
+
+
+
+
+models <- list(
+  "Apolitical vs Political" = model_a,
+  "Slanted vs Balanced"     = model_b,
+  "Slant Abs Distance"      = model_c,
+  "Slanted x Left Lean"     = model_d,
+  "Slant Abs x Left Lean"   = model_e,
+  "Non-linear Slant"        = model_f
+)
+
+dir.create("figures", showWarnings = FALSE)
+
+modelsummary(
+  models,
+  exponentiate = TRUE,
+  estimate     = "{estimate}",
+  statistic    = "[{conf.low}, {conf.high}]",
+  tidy_args    = list(conf.int = TRUE, conf.level = 0.95),
+  gof_omit     = ".*",
+  title        = "Odds Ratios with 95% Wald CIs",
+  output       = "figures/model_summary.html"   # writes file directly
+)
+
+
+ggsave('figures/model_summary.png', height=8, width=8)
+```
+
+# Residual Analysis
+```{r}
+# Not singular
+isSingular(model_f)
+
+# Normality of residuals histogram
+
+
+## Simulate residuals that respect the binomial GLMM structure
+sim <- simulateResiduals(fittedModel = model_f, n = 1000)  # increase n if you like
+hist(sim$scaledResiduals, breaks = 30,
+     main = "DHARMa scaled residuals",
+     xlab = "Scaled residual")
+
+testUniformity(sim)   # Highly significant deviation from uniformity - addressed with random slopes
+testDispersion(sim)       
+testZeroInflation(sim)  
+
+plotResiduals(sim, fitted(model_f))
+
+# Significant outliers
+testOutliers(sim)
+
+
+
+infl <- influence(model_f, group = "Discipline")
+plot(infl, which = "cook")
+cd <- cooks.distance(infl)
+cd
+
+infl_dec  <- influence(model_f, group = "Decade")
+plot(infl_dec, which = "cook")
+cd <- cooks.distance(infl_dec)
+cd
+
+# Random effects centered at 0
+re <- ranef(model_f, condVar = TRUE)
+lattice::qqmath(re)  # QQ plots by group
+lattice::dotplot(re)
+
+
+```
+
+
+# Robustness checks
+First attempt alternative MLM specifications (This takes quite some time and just confirms
+that alternative approaches are necessary)
+```{r, eval=FALSE}
+# Random slopes:
+model_f_slopes <- glmer(
+  Causal ~ Slant_Cat + (1 + Slant_Cat | Discipline) + (1 | Decade),
+  data = df_pol,
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+
+# Adding slopes for discipline produces singular fit
+summary(model_f_slopes)
+isSingular(model_f_slopes)
+
+model_f_slopes <- glmer(
+  Causal ~ Slant_Cat + (1 | Discipline) + (1 + Slant_Cat | Decade),
+  data = df_pol,
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+# Same for Decade
+summary(model_f_slopes)
+isSingular(model_f_slopes)
+
+
+# Try simplifying the structure
+df_pol <- df_pol %>%
+  mutate(slant_quad = case_when(
+    Slant_Cat == "Apolitical" ~ "Apolitical",
+    Slant_Cat == "Balanced"   ~ "Balanced",
+    Slant_Cat == "Slight left" ~ "Left-slant",
+    Slant_Cat == "Left" ~ "Left-slant",
+    TRUE                      ~ "Right-slant"
+  ))
+# Make "Balanced" the reference
+df_pol$slant_quad <- factor(df_pol$slant_quad, levels = c("Balanced", "Apolitical", "Left-slant",'Right-slant'))
+
+model_f_slopes <- glmer(
+  Causal ~ slant_quad + (1 + slant_quad | Discipline) + (1 | Decade),
+  data = df_pol,
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+
+isSingular(model_f_slopes)
+
+summary(model_f_slopes)
+
+## Simulate residuals that respect the binomial GLMM structure
+sim <- simulateResiduals(fittedModel = model_f_slopes, n = 1000)
+hist(sim$scaledResiduals, breaks = 30,
+     main = "DHARMa scaled residuals",
+     xlab = "Scaled residual")
+
+testUniformity(sim)   
+testDispersion(sim)       
+testZeroInflation(sim)  
+plotResiduals(sim, fitted(model_f))
+testOutliers(sim)
+# all of the residual issues remain
+
+
+
+infl <- influence(model_f, group = "Discipline")
+plot(infl, which = "cook")
+cd <- cooks.distance(infl)
+cd
+
+# OLRE attempt
+df_pol$obs <- seq_len(nrow(df_pol))
+m_olre <- glmer(Causal ~ slant_quad + (1 | Discipline) + (1 | Decade) + (1 | obs),
+                data=df_pol, family=binomial,
+                control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+m_cloglog <- update(m_olre, family = binomial(link = "cloglog"))
+m_probit  <- update(m_olre, family = binomial(link = "probit"))
+
+
+# Further coarsening
+model_f_slopes <- glmer(
+  Causal ~ slant_tri + (1 + slant_tri | Discipline) + (1 | Decade),
+  data = df_pol,
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+df_pol <- df_pol %>%
+  mutate(slant_tri = case_when(
+    Slant_Cat == "Apolitical" ~ "Apolitical",
+    Slant_Cat == "Balanced"   ~ "Balanced",
+    TRUE                      ~ "Slanted"
+  ))
+# Make "Balanced" the reference
+df_pol$slant_tri <- factor(df_pol$slant_tri, levels = c("Balanced", "Apolitical", "Slanted"))
+
+sim <- simulateResiduals(fittedModel = model_f_slopes, n = 1000)
+hist(sim$scaledResiduals, breaks = 30,
+     main = "DHARMa scaled residuals",
+     xlab = "Scaled residual")
+
+testUniformity(sim)   
+testDispersion(sim)       
+testZeroInflation(sim)  
+plotResiduals(sim, fitted(model_f))
+testOutliers(sim)
+
+```
+
+Nonparametric approaches
+```{r}
+ps <- c()
+# Apolitical vs Political
+df2 <- df_pol %>%
+  mutate(Slanted = ifelse(Slant_Cat %in% c("Slight left","Left","Strong Left",
+                                           "Slight right","Right","Strong Right", "Balanced"), 1L,0L), 
+         Decade = ifelse(Decade %in% c("1950","1960","1970","1980"), "Other", Decade))
+df2$stratum <- interaction(df2$Discipline, df2$Decade, drop = TRUE)
+
+tab <- xtabs(~ Slanted + Causal + stratum, data = df2)
+tab_d <- array(as.numeric(tab), dim = dim(tab), dimnames = dimnames(tab))
+cmh <- mantelhaen.test(tab_d, correct = TRUE)  
+cmh
+ps <- c(ps, cmh$p.value)
+
+# Apolitical vs Balanced
+df2 <- df_pol %>%
+  mutate(Slanted = ifelse(Slant_Cat %in% c("Balanced"), 1L,
+                          ifelse(Slant_Cat == "Apolitical", 0L, NA_integer_)), 
+         Decade = ifelse(Decade %in% c("1950","1960","1970","1980"), "Other", Decade)) %>%
+  filter(!is.na(Slanted))
+df2$stratum <- interaction(df2$Discipline, df2$Decade, drop = TRUE)
+tab <- xtabs(~ Slanted + Causal + stratum, data = df2)
+tab_d <- array(as.numeric(tab), dim = dim(tab), dimnames = dimnames(tab))
+cmh <- mantelhaen.test(tab_d, correct = TRUE)  # or exact=TRUE if you prefer
+cmh
+ps <- c(ps, cmh$p.value)
+
+# Slanted vs Apolitical
+df2 <- df_pol %>%
+  mutate(Slanted = ifelse(Slant_Cat %in% c("Slight left","Left","Strong Left",
+                                           "Slight right","Right","Strong Right"), 1L,
+                          ifelse(Slant_Cat == "Apolitical", 0L, NA_integer_)), 
+         Decade = ifelse(Decade %in% c("1950","1960","1970","1980"), "Other", Decade)) %>%
+  filter(!is.na(Slanted))
+df2$stratum <- interaction(df2$Discipline, df2$Decade, drop = TRUE)
+tab <- xtabs(~ Slanted + Causal + stratum, data = df2)
+tab_d <- array(as.numeric(tab), dim = dim(tab), dimnames = dimnames(tab))
+cmh <- mantelhaen.test(tab_d, correct = TRUE)  # or exact=TRUE if you prefer
+cmh
+ps <- c(ps, cmh$p.value)
+
+# Slanted vs Balanced
+df2 <- df_pol %>%
+  mutate(Slanted = ifelse(Slant_Cat %in% c("Slight left","Left","Strong Left",
+                                           "Slight right","Right","Strong Right"), 1L,
+                          ifelse(Slant_Cat == "Balanced", 0L, NA_integer_)), 
+         Decade = ifelse(Decade %in% c("1950","1960","1970","1980"), "Other", Decade)) %>%
+  filter(!is.na(Slanted))
+df2$stratum <- interaction(df2$Discipline, df2$Decade, drop = TRUE)
+tab <- xtabs(~ Slanted + Causal + stratum, data = df2)
+tab_d <- array(as.numeric(tab), dim = dim(tab), dimnames = dimnames(tab))
+cmh <- mantelhaen.test(tab_d, correct = TRUE)  # or exact=TRUE if you prefer
+cmh
+ps <- c(ps, cmh$p.value)
+
+# Left slanted vs Balanced
+df2 <- df_pol %>%
+  mutate(Slanted = ifelse(Slant_Cat %in% c("Slight left","Left","Strong Left"), 1L,
+                          ifelse(Slant_Cat == "Balanced", 0L, NA_integer_)), 
+         Decade = ifelse(Decade %in% c("1950","1960","1970","1980"), "Other", Decade)) %>%
+  filter(!is.na(Slanted))
+df2$stratum <- interaction(df2$Discipline, df2$Decade, drop = TRUE)
+tab <- xtabs(~ Slanted + Causal + stratum, data = df2)
+tab_d <- array(as.numeric(tab), dim = dim(tab), dimnames = dimnames(tab))
+cmh <- mantelhaen.test(tab_d, correct = TRUE)  # or exact=TRUE if you prefer
+cmh
+ps <- c(ps, cmh$p.value)
+
+# Right slanted vs balanced
+df2 <- df_pol %>%
+  mutate(Slanted = ifelse(Slant_Cat %in% c("Slight right","Right","Strong right"), 1L,
+                          ifelse(Slant_Cat == "Balanced", 0L, NA_integer_)), 
+         Decade = ifelse(Decade %in% c("1950","1960","1970","1980"), "Other", Decade)) %>%
+  filter(!is.na(Slanted))
+df2$stratum <- interaction(df2$Discipline, df2$Decade, drop = TRUE)
+tab <- xtabs(~ Slanted + Causal + stratum, data = df2)
+tab_d <- array(as.numeric(tab), dim = dim(tab), dimnames = dimnames(tab))
+cmh <- mantelhaen.test(tab_d, correct = TRUE) 
+cmh
+ps <- c(ps, cmh$p.value)
+
+# Left slanted vs Apolitical
+df2 <- df_pol %>%
+  mutate(Slanted = ifelse(Slant_Cat %in% c("Slight left","Left","Strong Left"), 1L,
+                          ifelse(Slant_Cat == "Apolitical", 0L, NA_integer_)), 
+         Decade = ifelse(Decade %in% c("1950","1960","1970","1980"), "Other", Decade)) %>%
+  filter(!is.na(Slanted))
+df2$stratum <- interaction(df2$Discipline, df2$Decade, drop = TRUE)
+tab <- xtabs(~ Slanted + Causal + stratum, data = df2)
+tab_d <- array(as.numeric(tab), dim = dim(tab), dimnames = dimnames(tab))
+cmh <- mantelhaen.test(tab_d, correct = TRUE)  # or exact=TRUE if you prefer
+cmh
+ps <- c(ps, cmh$p.value)
+
+# Right slanted vs Apolitical
+df2 <- df_pol %>%
+  mutate(Slanted = ifelse(Slant_Cat %in% c("Slight right","Right","Strong right"), 1L,
+                          ifelse(Slant_Cat == "Apolitical", 0L, NA_integer_)), 
+         Decade = ifelse(Decade %in% c("1950","1960","1970","1980"), "Other", Decade)) %>%
+  filter(!is.na(Slanted))
+df2$stratum <- interaction(df2$Discipline, df2$Decade, drop = TRUE)
+tab <- xtabs(~ Slanted + Causal + stratum, data = df2)
+tab_d <- array(as.numeric(tab), dim = dim(tab), dimnames = dimnames(tab))
+cmh <- mantelhaen.test(tab_d, correct = TRUE) 
+cmh
+ps <- c(ps, cmh$p.value)
+
+# Holm-Bonferroni correction on ps
+p.adjust(ps, method = "holm")
+
+
+# Slight vs regular right
+df2 <- df_pol %>%
+  mutate(Slanted = ifelse(Slant_Cat %in% c("Right","Strong right"), 1L,
+                          ifelse(Slant_Cat == "Slight right", 0L, NA_integer_)), 
+         Decade = ifelse(Decade %in% c("1950","1960","1970","1980","1990"), "Other", Decade)) %>%
+  filter(!is.na(Slanted))
+df2$stratum <- interaction(df2$Discipline, df2$Decade, drop = TRUE)
+tab <- xtabs(~ Slanted + Causal + stratum, data = df2)
+tab_d <- array(as.numeric(tab), dim = dim(tab), dimnames = dimnames(tab))
+cmh <- mantelhaen.test(tab_d, correct = TRUE) 
+cmh
+
+# Slight vs regular left
+df2 <- df_pol %>%
+  mutate(Slanted = ifelse(Slant_Cat %in% c("Left","Strong left"), 1L,
+                          ifelse(Slant_Cat == "Slight left", 0L, NA_integer_)), 
+         Decade = ifelse(Decade %in% c("1950","1960","1970","1980","1990"), "Other", Decade)) %>%
+  filter(!is.na(Slanted))
+df2$stratum <- interaction(df2$Discipline, df2$Decade, drop = TRUE)
+tab <- xtabs(~ Slanted + Causal + stratum, data = df2)
+tab_d <- array(as.numeric(tab), dim = dim(tab), dimnames = dimnames(tab))
+cmh <- mantelhaen.test(tab_d, correct = TRUE) 
+cmh
+
+df_pol <- df_pol %>%
+  mutate(slant_quad = case_when(
+    Slant_Cat == "Apolitical" ~ "Apolitical",
+    Slant_Cat == "Balanced"   ~ "Balanced",
+    Slant_Cat == "Slight left" ~ "Left-slant",
+    Slant_Cat == "Left" ~ "Left-slant",
+    TRUE                      ~ "Right-slant"
+  ))
+
+# Make the 4-level factor (adjust labels to match your data)
+df_np <- df_pol %>%
+  mutate(
+    slant_quad = factor(slant_quad,
+                        levels = c("Apolitical","Balanced","Left-slant","Right-slant")),
+    stratum = interaction(Discipline, Decade, drop = TRUE),
+    Decade = ifelse(Decade %in% c("1950","1960","1970","1980","1990"), "Other", Decade)
+  ) %>%
+  filter(!is.na(Causal), !is.na(slant_quad), !is.na(stratum))
+
+# Stratified non-parametric test of independence (permutation-based p-value)
+# teststat = "quadratic" gives a chi-square–type multi-sample statistic
+df_np$stratum <- interaction(df_np$Discipline, df_np$Decade, drop = TRUE)
+it <- coin::independence_test(Causal ~ slant_quad | stratum,
+                        data = df_np,
+                        teststat = "quadratic",
+                        distribution = coin::approximate(B = 10000))  # permutation p-value
+it
+
+
+
+```
+
+7-levels of slant
+```{r}
+df_pol7 <- df %>%
+  mutate(
+    Slant_Cat7 = case_when(
+      Rating == "A" ~ "Apolitical",
+      Slant_All == 1 ~ "Strong left",
+      Slant_All == 2 ~ "Left",
+      Slant_All == 3 ~ "Slight left",
+      Slant_All == 4 ~ "Balanced",
+      Slant_All == 5 ~ "Slight right",
+      Slant_All == 6 ~ "Right",
+      Slant_All == 7 ~ "Strong right",
+      TRUE ~ as.character(Slant_All)  # fall-back for any unhandled values
+    ))
+
+# Robustness to all 7 categories
+model_f_7 <- glmer(
+  Causal ~ Slant_Cat7 + (1 | Discipline) + (1 | Decade),
+  data = df_pol7,
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+
+summary(model_f_7)
+s      <- summary(model_f_7)          
+coefs  <- s$coefficients    
+ps <- coefs[, "Pr(>|z|)"] 
+p.adjust(ps[2:8], method = "holm")
+
+ci <- confint(model_f_7, method = "Wald")  # or method = "profile"
+odds_ratios <- exp(cbind(coef = fixef(model_f_7), ci[rownames(ci) %in% names(fixef(model_f_7)), ]))
+odds_ratios
+```
+
+OLS and Logistic
+```{r}
+# OLS w/fixed effects for comparison
+model_f_ols <- lm(
+  Causal ~ Slant_Cat + Discipline + Decade,
+  data = df_pol,
+  na.action = na.omit,
+)
+summary(model_f_ols)
+
+# Logistic w/ fixed effects for comparison
+model_f_log <- glm(
+  Causal ~ Slant_Cat + Discipline + Decade,
+  data = df_pol,
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+summary(model_f_log)
+
+# Make three categories Apolitical, Balanced, Slanted
+df_pol <- df_pol %>%
+  mutate(slant_tri = case_when(
+    Slant_Cat == "Apolitical" ~ "Apolitical",
+    Slant_Cat == "Balanced"   ~ "Balanced",
+    TRUE                      ~ "Slanted"
+  ))
+# Make "Balanced" the reference
+df_pol$slant_tri <- factor(df_pol$slant_tri, levels = c("Balanced", "Apolitical", "Slanted"))
+model_f_log2 <- glm(
+  Causal ~ slant_tri + Discipline + Decade,
+  data = df_pol,
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+summary(model_f_log2)
+
+# Make three categories Apolitical, Balanced, Slanted
+df_pol <- df_pol %>%
+  mutate(slant_quad = case_when(
+    Slant_Cat == "Apolitical" ~ "Apolitical",
+    Slant_Cat == "Balanced"   ~ "Balanced",
+    Slant_Cat == "Slight left" ~ "Left-slant",
+    Slant_Cat == "Left" ~ "Left-slant",
+    TRUE                      ~ "Right-slant"
+  ))
+# Make "Balanced" the reference
+df_pol$slant_quad <- factor(df_pol$slant_quad, levels = c("Balanced", "Apolitical", "Left-slant",'Right-slant'))
+model_f_log2 <- glm(
+  Causal ~ slant_quad + Discipline + Decade,
+  data = df_pol,
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+summary(model_f_log2)
+
+
+
+## ROBUST SES
+
+
+# Two-way cluster <-- used with HC0, HC1; Attempted HC2 and HC3 but apprantly the computational time required is too much.
+V_CL_2way <- function(m) {
+  mf <- model.frame(m)
+  sandwich::vcovCL(m, cluster = mf[c("Discipline","Decade")], type = "HC0")
+}
+
+lmtest::coeftest(model_f_log2, vcov. = V_CL_2way)
+
+V_CL_2way <- function(m) {
+  mf <- model.frame(m)
+  sandwich::vcovCL(m, cluster = mf[c("Discipline","Decade")], type = "HC1")
+}
+lmtest::coeftest(model_f_log2, vcov. = V_CL_2way)
+
+```
+
+Random slopes
+```{r}
+# Random slopes:
+model_f_slopes <- glmer(
+  Causal ~ Slant_Cat + (1 + Slant_Cat | Discipline) + (1 | Decade),
+  data = df_pol,
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+
+summary(model_f_slopes)
+isSingular(model_f_slopes)
+
+ci <- confint(model_f_slopes, method = "Wald")  # or method = "profile"
+odds_ratios <- exp(cbind(coef = fixef(model_f_slopes), ci[rownames(ci) %in% names(fixef(model_f_slopes)), ]))
+odds_ratios
+
+write.csv(coef(model_f_slopes)$Discipline, "random_slopes.csv", row.names = TRUE)
+```
+
+
+# Journal Discipline Analysis
+Slant breakdown by discipline (Figure 2)
+```{r}
+table(df$Discipline)
+
+df <- df %>% 
+  mutate(Slant = case_when(
+    Slant == 1 ~ 2,
+    Slant == 7 ~ 6,
+    TRUE ~ Slant
+  ))
+
+slant_cols  <- c(
+  "Left"        = "#4393c3",
+  "Slight left" = "#92c5de",
+  "Balanced"    = "gray70",
+  "Slight right"= "#f4a582",
+  "Right"       = "#d6604d",
+  "Apolitical"  = "gray30"
+)
+
+slant_by_disc <- df %>%
+  mutate(
+    Discipline = dplyr::recode(
+      Discipline,
+      "B"  = "Business",
+      "E"  = "Economics",
+      "I"  = "Interdisciplinary",
+      "O"  = "Other",
+      "P"  = "Psychology",
+      "PH" = "Public Health",
+      "PS" = "Political Science",
+      "S"  = "Sociology",
+      .default = Discipline
+    ),
+    Slant = tidyr::replace_na(Slant, 7L),
+    Slant = Slant - 1
+  ) %>%
+  count(Discipline, Slant) %>%
+  complete(Discipline, Slant = 1:6, fill = list(n = 0)) %>%
+  mutate(
+    Slant = factor(
+      Slant, levels = 1:6,
+      labels = c("Left","Slight left","Balanced","Slight right","Right","Apolitical")
+    )
+  )
+
+
+# Order by share of "Left"
+left_share <- slant_by_disc %>%
+  group_by(Discipline) %>%
+  summarise(pct_left = sum(n[Slant == "Left"], na.rm = TRUE) / sum(n), .groups = "drop")
+
+slant_by_disc <- slant_by_disc %>%
+  left_join(left_share, by = "Discipline") %>%
+  mutate(Discipline = fct_reorder(Discipline, pct_left, .desc = TRUE))
+
+# Plot as percentages
+ggplot(slant_by_disc, aes(x = Discipline, y = n, fill = Slant)) +
+  geom_col(position = position_fill(reverse = TRUE)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = slant_cols) +
+  coord_flip() +
+  labs(
+    title = "(Political) Slant of Articles by Discipline",
+    y = "Percent", x = ""
+  ) +
+  theme_bw()
+ggsave('figures/slant_by_discipline.png', height=3, width=6)
+
+
+table(df$Discipline,df$Rating)
+table(df$Discipline,df$Slant)
+
+```
+
+Proportion leftish by discipline and decade (Not included)
+```{r}
+leftish_levels <- c("Left","Slight left")
+
+df_prepped <- df %>%
+  mutate(
+    Discipline = dplyr::recode(
+      Discipline,
+      "B"  = "Business",
+      "E"  = "Economics",
+      "I"  = "Interdisciplinary",
+      "O"  = "Other",
+      "P"  = "Psychology",
+      "PH" = "Public Health",
+      "PS" = "Political Science",
+      "S"  = "Sociology",
+      .default = Discipline
+    ),
+    Slant_collapsed = dplyr::case_when(
+      is.na(Slant)      ~ "Apolitical",
+      Slant %in% c(1,2) ~ "Left",
+      Slant == 3        ~ "Slight left",
+      Slant == 4        ~ "Balanced",
+      Slant == 5        ~ "Slight right",
+      Slant %in% c(6,7) ~ "Right",
+      TRUE              ~ "Apolitical"
+    ),
+    Leftish  = Slant_collapsed %in% leftish_levels,
+    Recorded = TRUE
+  ) %>%
+  filter(!is.na(Decade), Decade >= 1980, Decade <= 2020)
+
+disc_decade <- df_prepped %>%
+  group_by(Discipline, Decade) %>%
+  summarise(
+    n_leftish = sum(Leftish, na.rm = TRUE),
+    n_total   = sum(Recorded, na.rm = TRUE),
+    prop_leftish = ifelse(n_total > 0, n_leftish / n_total, NA_real_),
+    .groups = "drop"
+  ) %>%
+  arrange(Decade, Discipline)
+
+# Overall decade proportions + 95% Wilson CI
+overall_decade <- df_prepped %>%
+  group_by(Decade) %>%
+  summarise(
+    n_leftish = sum(Leftish, na.rm = TRUE),
+    n_total   = sum(Recorded, na.rm = TRUE),
+    prop_leftish = ifelse(n_total > 0, n_leftish / n_total, NA_real_),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    z = 1.96,
+    denom  = 1 + (z^2 / n_total),
+    center = (prop_leftish + (z^2 / (2*n_total))) / denom,
+    half   = z * sqrt((prop_leftish*(1 - prop_leftish) + (z^2/(4*n_total))) / n_total) / denom,
+    lower  = pmax(0, center - half),
+    upper  = pmin(1, center + half)
+  )
+
+# (Optional) nice discipline colors
+disc_cols <- c(
+  "Business" = "#1b9e77",
+  "Economics" = "#d95f02",
+  "Interdisciplinary" = "#7570b3",
+  "Other" = "#e7298a",
+  "Psychology" = "#66a61e",
+  "Public Health" = "#e6ab02",
+  "Political Science" = "#a6761d",
+  "Sociology" = "#1f78b4"
+)
+
+# Plot: discipline lines + overall black line with CI band
+overall_decade$Decade <- as.numeric(as.character(overall_decade$Decade))
+disc_decade$Decade <- as.numeric(as.character(disc_decade$Decade))
+ggplot() +
+  geom_ribbon(
+    data = overall_decade,
+    aes(x = Decade, ymin = lower, ymax = upper),
+    fill = "black", alpha = 0.2
+  ) +
+  geom_line(  # ~3× thicker
+    data = overall_decade,
+    aes(x = Decade, y = prop_leftish),
+    color = "black", linewidth = 1.75
+  ) +
+  geom_line(
+    data = disc_decade,
+    aes(x = Decade, y = prop_leftish, color = Discipline, group = Discipline),
+    linewidth = 0.9, alpha = 0.9
+  ) +
+  geom_point(
+    data = disc_decade,
+    aes(x = Decade, y = prop_leftish, color = Discipline),
+    size = 1.25, alpha = 0.9
+  ) +
+  scale_x_continuous(breaks = seq(1980, max(disc_decade$Decade, na.rm = TRUE), by = 10)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 0.5)) +
+  scale_color_manual(values = disc_cols) +
+  labs(
+    title = "Share of Left-Slanted Articles by Decade and Discipline",
+    x = "Decade",
+    y = "Percent Left-Slanted",
+    color = "Discipline"
+  ) +
+  theme_bw()
+ggsave('figures/leftish_by_discipline.png', height=3, width=6)
+
+```
+
+Proportion causal by discipline and slant (Figure S3)
+```{r}
+df_prepped <- df %>%
+  mutate(
+    Discipline = dplyr::recode(
+      Discipline,
+      "B"="Business","E"="Economics","I"="Interdisciplinary","O"="Other",
+      "P"="Psychology","PH"="Public Health","PS"="Political Science","S"="Sociology",
+      .default = Discipline
+    ),
+    Slant_collapsed = dplyr::case_when(
+      is.na(Slant)      ~ "Apolitical",
+      Slant %in% c(1,2) ~ "Left",
+      Slant == 3        ~ "Slight left",
+      Slant == 4        ~ "Balanced",
+      Slant == 5        ~ "Slight right",
+      Slant %in% c(6,7) ~ "Right",
+      TRUE              ~ "Apolitical"
+    ),
+    CausalFlag = as.logical(Causal)   # works for 0/1 or TRUE/FALSE
+  )
+
+
+# 2) Helper to add Wilson 95% CI
+add_wilson <- function(d){
+  d %>%
+    mutate(
+      prop = ifelse(n_tot > 0, n_causal / n_tot, NA_real_),
+      z = 1.96,
+      denom = 1 + (z^2 / n_tot),
+      center = (prop + (z^2 / (2*n_tot))) / denom,
+      half   = z * sqrt((prop*(1 - prop) + (z^2/(4*n_tot))) / n_tot) / denom,
+      lower  = pmax(0, center - half),
+      upper  = pmin(1, center + half)
+    ) %>%
+    select(-z, -denom, -center, -half)
+}
+
+# 3) Overall by discipline
+overall_by_disc <- df_prepped %>%
+  group_by(Discipline) %>%
+  summarise(
+    n_causal = sum(CausalFlag, na.rm = TRUE),
+    n_tot    = sum(!is.na(CausalFlag)),
+    .groups = "drop"
+  ) %>%
+  add_wilson() %>%
+  mutate(Subset = "All articles")
+
+# 4) Slanted-only (exclude Balanced & Apolitical)
+slanted_by_disc <- df_prepped %>%
+  filter(Slant_collapsed %in% c("Left","Slight left","Slight right","Right")) %>%
+  group_by(Discipline) %>%
+  summarise(
+    n_causal = sum(CausalFlag, na.rm = TRUE),
+    n_tot    = sum(!is.na(CausalFlag)),
+    .groups = "drop"
+  ) %>%
+  add_wilson() %>%
+  mutate(Subset = "Slanted only")
+
+# 5) Combine + order disciplines by overall proportion
+both <- bind_rows(overall_by_disc, slanted_by_disc)
+disc_order <- overall_by_disc %>% arrange(desc(prop)) %>% pull(Discipline)
+both <- both %>% mutate(
+  Discipline = factor(Discipline, levels = disc_order),
+  Subset = factor(Subset, levels = c("All articles","Slanted only"))
+)
+
+# Optional: reuse your palette, else comment this out
+disc_cols <- c(
+  "Business" = "#1b9e77","Economics" = "#d95f02","Interdisciplinary" = "#7570b3",
+  "Other" = "#e7298a","Psychology" = "#66a61e","Public Health" = "#e6ab02",
+  "Political Science" = "#a6761d","Sociology" = "#1f78b4"
+)
+
+# 6) Plot (point + 95% CI), side-by-side
+ggplot(both, aes(x = Discipline, y = prop, color = Discipline)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, alpha = 1) +
+  geom_point(size = 2.6, alpha = 0.5) +
+  coord_flip() +
+  facet_wrap(~ Subset, nrow = 1) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  scale_color_manual(values = disc_cols, guide = "none") +
+  labs(
+    title = "Proportion Using Causal Language by Discipline",
+    x = "", y = "Percent with Overreaching Causal Language"
+  ) +
+  theme_bw()
+
+ggsave('figures/causal_by_discipline.png', height=3, width=6)
+```
+
+Difference in proportion (Not included)
+```{r}
+diff_disc <- df_prepped %>%
+  mutate(
+    Slanted     = Slant_collapsed %in% c("Left","Slight left","Slight right","Right"),
+    NonSlanted  = Slant_collapsed %in% c("Balanced","Apolitical")
+  ) %>%
+  group_by(Discipline) %>%
+  summarise(
+    x1 = sum(CausalFlag & Slanted, na.rm = TRUE),
+    n1 = sum(Slanted & !is.na(CausalFlag)),
+    x0 = sum(CausalFlag & NonSlanted, na.rm = TRUE),
+    n0 = sum(NonSlanted & !is.na(CausalFlag)),
+    p1 = ifelse(n1 > 0, x1 / n1, NA_real_),
+    p0 = ifelse(n0 > 0, x0 / n0, NA_real_),
+    diff  = p1 - p0,
+    se    = sqrt(ifelse(n1 > 0, p1 * (1 - p1) / n1, 0) +
+                 ifelse(n0 > 0, p0 * (1 - p0) / n0, 0)),
+    lower = pmax(-1, diff - 1.96 * se),
+    upper = pmin( 1, diff + 1.96 * se),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(diff)) %>%
+  mutate(Discipline = fct_reorder(Discipline, diff))
+
+# Plot (positive = slanted uses more causal language than non-slanted)
+ggplot(diff_disc, aes(y = Discipline, x = diff, color = Discipline)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.22, alpha = 0.85) +
+  geom_point(size = 2.6, alpha = 0.9) +
+  scale_x_continuous(labels = percent_format(accuracy = 1), limits = c(-1, 1)) +
+  scale_color_manual(values = disc_cols, guide = "none") +
+  labs(
+    title = "Difference in Causal Language: Slanted − Non-slanted",
+    x = "Percentage point difference",
+    y = ""
+  ) +
+  theme_bw()
+```
+
